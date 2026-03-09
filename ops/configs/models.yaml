@@ -1,0 +1,6 @@
+registry:
+  name: "aura_infer_model"
+  variants:
+    full:  "ollama:llama3.2:1b?num_predict=192&temperature=0.2"
+    fast:  "ollama:qwen2.5:0.5b-instruct?num_predict=128&temperature=0.0"
+    quant: "ollama:smollm2:360m-instruct-q2_K?num_predict=64&temperature=0.0"

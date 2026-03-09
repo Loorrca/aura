@@ -1,0 +1,117 @@
+import os
+import time
+import threading
+from typing import List, Optional
+
+import mlflow
+import mlflow.pyfunc
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response
+from pydantic import BaseModel
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
+MLFLOW_TRACKING_URI = "http://137.194.194.21:5000"
+
+MODEL_VERSION = os.getenv("AURA_MODEL_VERSION", "1")
+DEFAULT_MODEL_URI = os.getenv("AURA_MODEL_URI", f"models:/aura_week3_model/{MODEL_VERSION}")
+DEFAULT_DELAY_MS = int(os.getenv("AURA_DELAY_MS", "0"))
+
+
+DEMO_FORCE_DELAY_ON_V1 = os.getenv("AURA_DEMO_FORCE_DELAY_ON_V1", "0") == "1"
+if DEMO_FORCE_DELAY_ON_V1 and DEFAULT_DELAY_MS == 0 and MODEL_VERSION == "1":
+    DEFAULT_DELAY_MS = 40
+
+ADMIN_TOKEN = os.getenv("AURA_INFER_ADMIN_TOKEN", "")
+
+app = FastAPI(title="AURA Inference Service", version="0.4")
+
+model = None
+_current_model_uri: Optional[str] = None
+_current_delay_ms: int = 0
+_load_lock = threading.Lock()
+
+REQS = Counter("inference_requests_total", "Total inference requests")
+ERRS = Counter("inference_errors_total", "Total inference errors")
+LAT = Histogram("inference_latency_seconds", "Inference latency in seconds")
+
+
+class PredictRequest(BaseModel):
+    inputs: List[List[float]]
+
+
+class LoadModelRequest(BaseModel):
+    model_uri: str
+    delay_ms: Optional[int] = None
+
+
+def _require_admin(req: Request):
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=500, detail="AURA_INFER_ADMIN_TOKEN not configured")
+    auth = req.headers.get("authorization", "")
+    if auth != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _load_model(model_uri: str, delay_ms: Optional[int] = None):
+    global model, _current_model_uri, _current_delay_ms
+    with _load_lock:
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        m = mlflow.pyfunc.load_model(model_uri)
+        model = m
+        _current_model_uri = model_uri
+        if delay_ms is not None:
+            _current_delay_ms = int(delay_ms)
+
+
+@app.on_event("startup")
+def startup():
+    global _current_delay_ms
+    _current_delay_ms = DEFAULT_DELAY_MS
+    _load_model(DEFAULT_MODEL_URI, delay_ms=_current_delay_ms)
+    print(f"Loaded model: {_current_model_uri} delay_ms={_current_delay_ms}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_uri": _current_model_uri, "delay_ms": _current_delay_ms}
+
+
+@app.get("/admin/status")
+def admin_status(req: Request):
+    _require_admin(req)
+    return {"model_uri": _current_model_uri, "delay_ms": _current_delay_ms}
+
+
+@app.post("/admin/load_model")
+def admin_load_model(req: Request, body: LoadModelRequest):
+    _require_admin(req)
+    if not body.model_uri.startswith("models:/"):
+        raise HTTPException(status_code=400, detail="model_uri must look like models:/name/version")
+    new_delay = _current_delay_ms if body.delay_ms is None else int(body.delay_ms)
+    _load_model(body.model_uri, delay_ms=new_delay)
+    return {"ok": True, "model_uri": _current_model_uri, "delay_ms": _current_delay_ms}
+
+
+@app.post("/predict")
+def predict(req: PredictRequest):
+    global model
+    REQS.inc()
+    start = time.time()
+    try:
+        if _current_delay_ms > 0:
+            time.sleep(_current_delay_ms / 1000.0)
+
+        df = pd.DataFrame(req.inputs, columns=["f1", "f2", "f3", "f4"])
+        preds = model.predict(df)
+        return {"predictions": [int(x) for x in preds]}
+    except Exception:
+        ERRS.inc()
+        raise
+    finally:
+        LAT.observe(time.time() - start)
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

@@ -1,0 +1,62 @@
+prometheus_url: "http://137.194.194.117:9090" 
+rms_ssh_host: "137.194.194.122"
+rms_ssh_user: "rms"
+rms_service_name: "aura-infer"
+gpu_ssh_user: "gpu"
+gpu_ssh_host: "10.194.12.1"
+
+router_public_base_url: "http://137.194.194.66:9000"
+router_admin_base_url: "http://137.194.194.66:9000"
+router_admin_token: "cm91YWJsZWw="
+
+backend_rms_url: "http://137.194.194.122:8000"
+backend_gpu_url: "http://10.194.12.1:8000"
+
+gpu_util_threshold: 30
+check_interval_seconds: 15
+restart_cooldown_seconds: 120
+switch_cooldown_seconds: 180
+
+post_hotswap_sleep_seconds: 1
+migrate_cooldown_seconds: 30
+rollback_cooldown_seconds: 30
+
+verify_latency_drop_timeout_seconds: 60
+verify_latency_drop_poll_seconds: 5
+verify_latency_drop_consecutive: 2
+
+latency_slo_ms: 20
+promql_latency_p95_rms_ms: '1000 * histogram_quantile(0.95, sum by (le) (rate(inference_latency_seconds_bucket{job="rms_inference"}[30s])))'
+promql_latency_p95_gpu_ms: '1000 * histogram_quantile(0.95, sum by (le) (rate(inference_latency_seconds_bucket{job="gpu_inference"}[30s])))'
+
+min_rps_for_decision: 0.1
+promql_rps_rms: 'sum(rate(inference_requests_total{job="rms_inference"}[2m]))'
+promql_rps_gpu: 'sum(rate(inference_requests_total{job="gpu_inference"}[2m]))'
+
+infer_admin_timeout_seconds: 20
+
+gpu_desired_delay_ms: 0
+rms_desired_delay_ms: 0
+
+desired_variant: "fast"
+model_registry:
+  name: "aura_infer_model"
+  variants:
+    full:  "models:/aura_week3_model/1"
+    fast:  "models:/aura_week3_model/2"
+    quant: "models:/aura_week3_model/2"
+
+node_capabilities:
+  rms:
+    supports: ["full", "fast"]
+  gpu:
+    supports: ["full", "fast", "quant"]
+
+anomaly_rules:
+  service_down:
+    promql: 'up{job="rms_inference"}'
+    threshold: 1         
+
+  latency_p95_ms_high:
+    promql: '1000 * histogram_quantile(0.95, sum(rate(inference_latency_seconds_bucket{job="rms_inference"}[2m])) by (le))'
+    threshold: 20

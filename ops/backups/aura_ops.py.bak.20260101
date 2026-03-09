@@ -1,0 +1,794 @@
+import json
+import subprocess
+import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Dict, Optional, List
+from datetime import datetime, timezone
+
+import requests
+import yaml
+
+STATE_PATH = Path("state.json")
+TRACE_PATH = Path("last_trace.json")
+TRACE_LOG_PATH = Path("trace.jsonl")   
+TRACE_LOG_MAX_BYTES = 50 * 1024 * 1024 
+TRACE_LOG_KEEP = 3  
+
+@dataclass
+class Event:
+    ts: float
+    kind: str
+    severity: str
+    details: Dict[str, Any]
+
+
+@dataclass
+class Diagnosis:
+    ts: float
+    hypothesis: str
+    evidence: Dict[str, Any]
+
+
+@dataclass
+class Decision:
+    ts: float
+    action: str
+    rationale: Dict[str, Any]
+
+
+@dataclass
+class ExecutionResult:
+    ts: float
+    action: str
+    ok: bool
+    verification: Dict[str, Any]
+    stdout: str = ""
+    stderr: str = ""
+
+
+def load_cfg() -> Dict[str, Any]:
+    return yaml.safe_load(Path("config.yaml").read_text())
+
+
+def read_state() -> Dict[str, Any]:
+    if STATE_PATH.exists():
+        return json.loads(STATE_PATH.read_text())
+    return {
+        "last_restart_ts": 0.0,
+        "last_switch_ts": 0.0,
+        "last_migrate_ts": 0.0,
+        "last_rollback_ts": 0.0,
+        "last_seen_model_version": None,
+        "last_seen_backend": None,
+    }
+
+def ts_iso(ts: float) -> str:
+    # local timezone ISO string (includes offset)
+    return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+
+def rotate_trace_log_if_needed() -> None:
+    try:
+        if TRACE_LOG_PATH.exists() and TRACE_LOG_PATH.stat().st_size >= TRACE_LOG_MAX_BYTES:
+            # rotate: .2 -> .3, .1 -> .2, current -> .1
+            for i in range(TRACE_LOG_KEEP, 0, -1):
+                src = TRACE_LOG_PATH.with_suffix(TRACE_LOG_PATH.suffix + f".{i}")
+                dst = TRACE_LOG_PATH.with_suffix(TRACE_LOG_PATH.suffix + f".{i+1}")
+                if src.exists():
+                    if i == TRACE_LOG_KEEP:
+                        src.unlink(missing_ok=True)
+                    else:
+                        src.rename(dst)
+            TRACE_LOG_PATH.rename(TRACE_LOG_PATH.with_suffix(TRACE_LOG_PATH.suffix + ".1"))
+    except Exception:
+        # never break the control loop due to logging
+        pass
+
+def write_state(state: Dict[str, Any]) -> None:
+    STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def promql_instant(prometheus_url: str, query: str) -> Optional[float]:
+    r = requests.get(f"{prometheus_url}/api/v1/query", params={"query": query}, timeout=5)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("status") != "success":
+        return None
+    result = data.get("data", {}).get("result", [])
+    if not result:
+        return None
+    val = float(result[0]["value"][1])
+    if val != val:  # NaN check
+        return None
+    return val
+
+
+def ssh_run(user: str, host: str, remote_cmd: str) -> subprocess.CompletedProcess:
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", f"{user}@{host}", remote_cmd]
+    return subprocess.run(cmd, text=True, capture_output=True)
+
+
+def get_health(base_url: str) -> Dict[str, Any]:
+    r = requests.get(f"{base_url.rstrip('/')}/health", timeout=5)
+    r.raise_for_status()
+    return r.json()
+
+
+def parse_model_version(model_uri: str) -> Optional[str]:
+    if not model_uri:
+        return None
+    parts = model_uri.strip().split("/")
+    return parts[-1] if len(parts) >= 3 else None
+
+
+def router_get_backend(cfg: Dict[str, Any]) -> Optional[str]:
+    try:
+        url = cfg["router_admin_base_url"].rstrip("/") + "/admin/backend"
+        token = cfg["router_admin_token"]
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=5)
+        r.raise_for_status()
+        return r.json().get("backend", "").rstrip("/")
+    except Exception:
+        return None
+
+
+def router_set_backend(cfg: Dict[str, Any], backend_url: str) -> None:
+    url = cfg["router_admin_base_url"].rstrip("/") + "/admin/backend"
+    token = cfg["router_admin_token"]
+    r = requests.post(
+        url,
+        json={"backend": backend_url},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=8,
+    )
+    r.raise_for_status()
+
+
+def ssh_gpu_util_percent(cfg: Dict[str, Any]) -> Optional[float]:
+    """Simple capability signal: GPU util from nvidia-smi via SSH."""
+    user = cfg["gpu_ssh_user"]
+    host = cfg["gpu_ssh_host"]
+    cmd = "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n1"
+    proc = ssh_run(user, host, cmd)
+    if proc.returncode != 0:
+        return None
+    try:
+        return float(proc.stdout.strip())
+    except Exception:
+        return None
+
+
+def infer_admin_load_model(cfg: Dict[str, Any], base_url: str, model_uri: str, delay_ms: int) -> Dict[str, Any]:
+    """Call inference service to hot-swap model without restart."""
+    token = cfg.get("router_admin_token", "")
+    if not token:
+        raise RuntimeError("router_admin_token not set in config.yaml")
+
+    timeout = int(cfg.get("infer_admin_timeout_seconds", 20))
+    url = base_url.rstrip("/") + "/admin/load_model"
+    r = requests.post(
+        url,
+        json={"model_uri": model_uri, "delay_ms": int(delay_ms)},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def pick_variant_model_uri(cfg: Dict[str, Any], variant: str) -> str:
+    variants = ((cfg.get("model_registry") or {}).get("variants") or {})
+    uri = (variants.get(variant) or "").strip()
+    if not uri:
+        raise RuntimeError(f"model_registry.variants.{variant} is missing/empty")
+    return uri
+
+def variant_supported(cfg: Dict[str, Any], node: str, variant: str) -> bool:
+    caps = (cfg.get("node_capabilities") or {}).get(node) or {}
+    supports = caps.get("supports") or []
+    return variant in supports
+
+def guess_variant_from_model_uri(cfg: Dict[str, Any], model_uri: Optional[str]) -> Optional[str]:
+    if not model_uri:
+        return None
+    variants = ((cfg.get("model_registry") or {}).get("variants") or {})
+    ver = parse_model_version(model_uri)
+    for name, uri in variants.items():
+        if uri == model_uri:
+            return name
+        if ver and parse_model_version(uri) == ver:
+            return name
+    return None
+
+# ---------- Agents ----------
+
+def observability_agent(cfg: Dict[str, Any], state: Dict[str, Any]) -> List[Event]:
+    events: List[Event] = []
+    now = time.time()
+
+    # --- Current backend (Week 6 routing awareness) ---
+    current_backend = router_get_backend(cfg)
+    if current_backend:
+        state["last_seen_backend"] = current_backend
+        write_state(state)
+
+    # --- Best-effort: learn which model is actually serving traffic (via router /health) ---
+    router_public = cfg.get("router_public_base_url", "").rstrip("/")
+    current_model_uri = None
+    current_variant = None
+    try:
+        if router_public:
+            rh = get_health(router_public)  # GET {router_public}/health
+            bh = (rh.get("backend_health") or {})
+            current_model_uri = bh.get("model_uri")
+            current_variant = guess_variant_from_model_uri(cfg, current_model_uri)
+    except Exception:
+        pass
+
+
+    # --- Service down (Week 5 rule, still useful) ---
+    rule_sd = cfg["anomaly_rules"]["service_down"]
+    up_val = promql_instant(cfg["prometheus_url"], rule_sd["promql"])
+    if up_val is not None and up_val < float(rule_sd["threshold"]):
+        events.append(Event(now, "service_down", "high", {"up_value": up_val, "threshold": rule_sd["threshold"]}))
+
+    # --- Week 6: migration / rollback signals ---
+    slo_ms = float(cfg.get("latency_slo_ms", 20))
+    gpu_thr = float(cfg.get("gpu_util_threshold", 30))
+    gpu_util = ssh_gpu_util_percent(cfg)
+
+    backend_rms = cfg.get("backend_rms_url", "").rstrip("/")
+    backend_gpu = cfg.get("backend_gpu_url", "").rstrip("/")
+
+    # If router is on RMS and RMS p95 is over SLO -> consider migrating to GPU
+    if current_backend and backend_rms and current_backend.rstrip("/") == backend_rms:
+        q_rms = cfg.get("promql_latency_p95_rms_ms")
+        rms_p95 = promql_instant(cfg["prometheus_url"], q_rms) if q_rms else None
+
+        # RPS gate (avoid acting on no-traffic / NaN windows)
+        min_rps = float(cfg.get("min_rps_for_decision", 0.0))
+        q_rps_rms = cfg.get("promql_rps_rms")
+        rms_rps = promql_instant(cfg["prometheus_url"], q_rps_rms) if q_rps_rms else None
+
+        if (
+            rms_p95 is not None
+            and rms_p95 > slo_ms
+            and rms_rps is not None
+            and rms_rps >= min_rps
+        ):
+            events.append(Event(
+                now,
+                "needs_migration",
+                "medium",
+                {
+                    "current_backend": current_backend,
+                    "rms_p95_ms": rms_p95,
+                    "rms_rps": rms_rps,
+                    "min_rps_for_decision": min_rps,
+                    "latency_slo_ms": slo_ms,
+                    "gpu_util_pct": gpu_util,
+                    "gpu_util_threshold": gpu_thr,
+                    "reason": "router_on_rms_and_rms_over_slo",
+                    "current_model_uri": current_model_uri,
+                    "current_variant": current_variant,
+                },
+            ))
+
+
+    # If router is on GPU and GPU p95 is over SLO -> rollback to RMS
+    if current_backend and backend_gpu and current_backend.rstrip("/") == backend_gpu:
+        q_gpu = cfg.get("promql_latency_p95_gpu_ms")
+        gpu_p95 = promql_instant(cfg["prometheus_url"], q_gpu) if q_gpu else None
+
+        # RPS gate
+        min_rps = float(cfg.get("min_rps_for_decision", 0.0))
+        q_rps_gpu = cfg.get("promql_rps_gpu")
+        gpu_rps = promql_instant(cfg["prometheus_url"], q_rps_gpu) if q_rps_gpu else None
+
+        if (
+            gpu_p95 is not None
+            and gpu_p95 > slo_ms
+            and gpu_rps is not None
+            and gpu_rps >= min_rps
+        ):
+            events.append(Event(
+                now,
+                "rollback_needed",
+                "high",
+                {
+                    "current_backend": current_backend,
+                    "gpu_p95_ms": gpu_p95,
+                    "gpu_rps": gpu_rps,
+                    "min_rps_for_decision": min_rps,
+                    "latency_slo_ms": slo_ms,
+                    "reason": "router_on_gpu_and_gpu_over_slo",
+                    "current_model_uri": current_model_uri,
+                    "current_variant": current_variant,
+                },
+            ))
+
+    return events
+
+
+def prioritize(events: List[Event]) -> Optional[Event]:
+    if not events:
+        return None
+    order = {
+        "service_down": 0,
+        "rollback_needed": 1,
+        "needs_migration": 2,
+    }
+    return sorted(events, key=lambda e: order.get(e.kind, 99))[0]
+
+
+def diagnosis_agent(evt: Event) -> Diagnosis:
+    now = time.time()
+    if evt.kind == "service_down":
+        return Diagnosis(now, "inference_service_unreachable", {"reason": "prom_up_is_0", **evt.details})
+    if evt.kind == "latency_high":
+        return Diagnosis(now, "latency_slo_violation", {"reason": "p95_above_threshold", **evt.details})
+    if evt.kind == "needs_migration":
+        return Diagnosis(now, "rms_over_slo_migrate", {"reason": "rms_over_slo", **evt.details})
+    if evt.kind == "rollback_needed":
+        return Diagnosis(now, "gpu_over_slo_rollback", {"reason": "gpu_over_slo", **evt.details})
+    return Diagnosis(now, "unknown", evt.details)
+
+
+def decision_agent(cfg: Dict[str, Any], diag: Diagnosis, state: Dict[str, Any]) -> Decision:
+    now = time.time()
+
+    restart_cd = int(cfg.get("restart_cooldown_seconds", 120))
+    switch_cd = int(cfg.get("switch_cooldown_seconds", 180))
+
+    migrate_cd = int(cfg.get("migrate_cooldown_seconds", 180))
+    rollback_cd = int(cfg.get("rollback_cooldown_seconds", 180))
+
+    last_restart = float(state.get("last_restart_ts", 0.0))
+    last_switch = float(state.get("last_switch_ts", 0.0))
+    last_migrate = float(state.get("last_migrate_ts", 0.0))
+    last_rollback = float(state.get("last_rollback_ts", 0.0))
+
+    # target "fast" variant from model_registry (fallback to old config)
+    target_uri = ((cfg.get("model_registry") or {}).get("variants") or {}).get("fast", "")
+    target_ver = parse_model_version(target_uri) or str(cfg.get("target_fast_model_version", "2"))
+
+    # Week 5: service down -> restart rms service
+    if diag.hypothesis == "inference_service_unreachable":
+        if now - last_restart < restart_cd:
+            return Decision(now, "do_nothing", {"policy": "restart_cooldown", "seconds_since_last": now - last_restart})
+        return Decision(now, "restart_inference", {"policy": "allowed"})
+
+    # Week 5: latency high -> switch model version on RMS
+    if diag.hypothesis == "latency_slo_violation":
+        if now - last_switch < switch_cd:
+            return Decision(now, "do_nothing", {"policy": "switch_cooldown", "seconds_since_last": now - last_switch})
+        if state.get("last_seen_model_version") == target_ver:
+            return Decision(now, "do_nothing", {"policy": "already_on_target_version", "target_version": target_ver})
+        return Decision(now, "switch_model_version", {"policy": "allowed", "target_version": target_ver})
+
+    # Week 6: migrate RMS -> GPU (router change)
+    if diag.hypothesis == "rms_over_slo_migrate":
+        if now - last_migrate < migrate_cd:
+            return Decision(now, "do_nothing", {"policy": "migrate_cooldown", "seconds_since_last": now - last_migrate})
+
+        gpu_util = diag.evidence.get("gpu_util_pct")
+        thr = float(diag.evidence.get("gpu_util_threshold", cfg.get("gpu_util_threshold", 30)))
+
+        # ----- figure out what RMS is currently serving (best-effort, using your helper) -----
+        current_rms_ver = str(state.get("last_seen_model_version") or "")
+        current_rms_uri = None
+        if current_rms_ver:
+            variants_map = ((cfg.get("model_registry") or {}).get("variants") or {})
+            for _, uri in variants_map.items():
+                if parse_model_version(uri) == current_rms_ver:
+                    current_rms_uri = uri
+                    break
+        current_rms_variant = guess_variant_from_model_uri(cfg, current_rms_uri)
+
+        # ----- choose desired variant for GPU, respecting capabilities -----
+        desired_variant = str(diag.evidence.get("current_variant") or cfg.get("desired_variant", "fast"))
+
+        # preference order: desired -> fast -> quant -> full (only those supported)
+        preference = [desired_variant, "fast", "quant", "full"]
+        preference = [v for v in preference if v]  # keep clean
+
+        chosen_variant = None
+        for v in preference:
+            if variant_supported(cfg, "gpu", v):
+                chosen_variant = v
+                break
+
+        if not chosen_variant:
+            return Decision(now, "do_nothing", {
+                "policy": "no_supported_variant_on_gpu",
+                "desired_variant": desired_variant,
+                "gpu_supports": ((cfg.get("node_capabilities") or {}).get("gpu") or {}).get("supports", []),
+            })
+
+        chosen_uri = pick_variant_model_uri(cfg, chosen_variant)
+        chosen_ver = parse_model_version(chosen_uri)
+
+        # ----- if GPU signal missing/busy, fallback: make RMS fast (if not already) -----
+        fast_uri = pick_variant_model_uri(cfg, "fast")
+        fast_ver = parse_model_version(fast_uri) or str(cfg.get("target_fast_model_version", "2"))
+
+        if gpu_util is None:
+            if str(current_rms_variant) != "fast" and str(current_rms_ver) != str(fast_ver):
+                return Decision(now, "switch_model_version", {
+                    "policy": "fallback_switch_fast_model",
+                    "because": "no_gpu_util_signal",
+                    "target_version": str(fast_ver),
+                    "target_uri": fast_uri,
+                    "current_rms_variant": current_rms_variant,
+                    "current_rms_version": current_rms_ver,
+                })
+            return Decision(now, "do_nothing", {
+                "policy": "no_gpu_util_signal_and_already_fast",
+                "target_version": str(fast_ver),
+                "target_uri": fast_uri,
+                "current_rms_variant": current_rms_variant,
+                "current_rms_version": current_rms_ver,
+            })
+
+        if float(gpu_util) >= thr:
+            if str(current_rms_variant) != "fast" and str(current_rms_ver) != str(fast_ver):
+                return Decision(now, "switch_model_version", {
+                    "policy": "fallback_switch_fast_model",
+                    "because": "gpu_busy",
+                    "gpu_util_pct": gpu_util,
+                    "threshold": thr,
+                    "target_version": str(fast_ver),
+                    "target_uri": fast_uri,
+                    "current_rms_variant": current_rms_variant,
+                    "current_rms_version": current_rms_ver,
+                })
+            return Decision(now, "do_nothing", {
+                "policy": "gpu_busy_and_already_fast",
+                "gpu_util_pct": gpu_util,
+                "threshold": thr,
+                "target_version": str(fast_ver),
+                "target_uri": fast_uri,
+                "current_rms_variant": current_rms_variant,
+                "current_rms_version": current_rms_ver,
+            })
+
+        return Decision(now, "migrate_backend_to_gpu", {
+            "policy": "allowed",
+            "because": "gpu_headroom_and_rms_over_slo",
+            "gpu_util_pct": gpu_util,
+            "chosen_variant": chosen_variant,
+            "chosen_uri": chosen_uri,
+            "chosen_version": chosen_ver,
+        })
+
+
+    # Week 6: rollback GPU -> RMS
+    if diag.hypothesis == "gpu_over_slo_rollback":
+        if now - last_rollback < rollback_cd:
+            return Decision(now, "do_nothing", {"policy": "rollback_cooldown", "seconds_since_last": now - last_rollback})
+
+        desired_variant = str(diag.evidence.get("current_variant") or cfg.get("desired_variant", "fast"))
+
+        preference = [desired_variant, "fast", "quant", "full"]
+        preference = [v for v in preference if v]
+
+        chosen_variant = None
+        for v in preference:
+            if variant_supported(cfg, "rms", v):
+                chosen_variant = v
+                break
+
+        if not chosen_variant:
+            return Decision(now, "do_nothing", {
+                "policy": "no_supported_variant_on_rms",
+                "desired_variant": desired_variant,
+                "rms_supports": ((cfg.get("node_capabilities") or {}).get("rms") or {}).get("supports", []),
+            })
+
+        chosen_uri = pick_variant_model_uri(cfg, chosen_variant)
+        chosen_ver = parse_model_version(chosen_uri)
+
+        return Decision(now, "rollback_backend_to_rms", {
+            "policy": "allowed",
+            "because": "gpu_over_slo",
+            "chosen_variant": chosen_variant,
+            "chosen_uri": chosen_uri,
+            "chosen_version": chosen_ver,
+        })
+
+    
+    return Decision(now, "do_nothing", {"policy": "no_rule"})
+
+
+def verify_latency_drop(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Week 5 helper: Poll RMS p95 (from anomaly_rules) until below threshold for N consecutive samples."""
+    rule_lat = cfg["anomaly_rules"]["latency_p95_ms_high"]
+    threshold = float(rule_lat["threshold"])
+    poll_s = int(cfg.get("verify_latency_drop_poll_seconds", 5))
+    timeout_s = int(cfg.get("verify_latency_drop_timeout_seconds", 60))
+    consecutive_needed = int(cfg.get("verify_latency_drop_consecutive", 2))
+
+    samples = []
+    good_streak = 0
+    t_end = time.time() + timeout_s
+
+    while time.time() < t_end:
+        val = promql_instant(cfg["prometheus_url"], rule_lat["promql"])
+        samples.append({"ts": time.time(), "p95_ms": val})
+        if val is not None and val <= threshold:
+            good_streak += 1
+            if good_streak >= consecutive_needed:
+                return {"ok": True, "threshold_ms": threshold, "samples": samples}
+        else:
+            good_streak = 0
+        time.sleep(poll_s)
+
+    return {"ok": False, "threshold_ms": threshold, "samples": samples}
+
+
+def execution_agent(cfg: Dict[str, Any], decision: Decision, state: Dict[str, Any]) -> ExecutionResult:
+    now = time.time()
+
+    # URLs
+    backend_rms = cfg.get("backend_rms_url", "").rstrip("/")
+    router_public = cfg.get("router_public_base_url", "").rstrip("/")
+
+    # best-effort refresh: current model version on RMS (direct)
+    try:
+        if backend_rms:
+            h = get_health(backend_rms)
+            state["last_seen_model_version"] = parse_model_version(h.get("model_uri", ""))
+            write_state(state)
+    except Exception:
+        pass
+
+    if decision.action == "do_nothing":
+        return ExecutionResult(now, "do_nothing", True, {"skipped": True})
+
+    # --- Week 5 actions on RMS ---
+    if decision.action == "restart_inference":
+        user = cfg["rms_ssh_user"]
+        host = cfg["rms_ssh_host"]
+        svc = cfg["rms_service_name"]
+
+        proc = ssh_run(user, host, f"sudo systemctl restart {svc}")
+        time.sleep(2)
+
+        ok = False
+        health = {}
+        try:
+            health = get_health(backend_rms)
+            ok = (health.get("status") == "ok")
+        except Exception:
+            ok = False
+
+        if ok:
+            state["last_restart_ts"] = time.time()
+            state["last_seen_model_version"] = parse_model_version(health.get("model_uri", ""))
+            write_state(state)
+
+        return ExecutionResult(time.time(), "restart_inference", ok, {"health": health}, proc.stdout.strip(), proc.stderr.strip())
+
+    if decision.action == "switch_model_version":
+        user = cfg["rms_ssh_user"]
+        host = cfg["rms_ssh_host"]
+        svc = cfg["rms_service_name"]
+        target_uri = ((cfg.get("model_registry") or {}).get("variants") or {}).get("fast", "")
+        target_ver = parse_model_version(target_uri) or str(cfg.get("target_fast_model_version", "2"))
+
+        cmd = (
+            f"sudo sed -i 's/^AURA_MODEL_VERSION=.*/AURA_MODEL_VERSION={target_ver}/' /etc/aura/infer.env && "
+            f"sudo systemctl restart {svc}"
+        )
+        proc = ssh_run(user, host, cmd)
+        time.sleep(2)
+
+        health = {}
+        observed_ver = None
+        try:
+            health = get_health(backend_rms)
+            observed_ver = parse_model_version(health.get("model_uri", ""))
+        except Exception:
+            pass
+
+        version_ok = (proc.returncode == 0) and (observed_ver == target_ver)
+        latency_verif = verify_latency_drop(cfg) if version_ok else {"ok": False, "reason": "version_not_ok"}
+        ok = bool(version_ok and latency_verif.get("ok") is True)
+
+        if version_ok:
+            state["last_switch_ts"] = time.time()
+            state["last_seen_model_version"] = observed_ver
+            write_state(state)
+
+        return ExecutionResult(
+            time.time(),
+            "switch_model_version",
+            ok,
+            {
+                "target_version": target_ver,
+                "observed_version": observed_ver,
+                "health": health,
+                "latency_drop_verification": latency_verif,
+            },
+            proc.stdout.strip(),
+            proc.stderr.strip(),
+        )
+
+    # --- Week 6 actions (routing migration) ---
+    if decision.action == "migrate_backend_to_gpu":
+        target = cfg["backend_gpu_url"].rstrip("/")
+
+        # Use the model chosen by decision_agent (fallback to config if missing)
+        desired_uri = (decision.rationale or {}).get("chosen_uri") or pick_variant_model_uri(cfg, str(cfg.get("desired_variant", "fast")))
+        desired_delay = int(cfg.get("gpu_desired_delay_ms", 0))
+
+        # 1) Hot-swap model on GPU (no restart)
+        try:
+            admin_resp = infer_admin_load_model(cfg, target, desired_uri, desired_delay)
+        except Exception as e:
+            return ExecutionResult(time.time(), "migrate_backend_to_gpu", False, {"error": f"gpu_hot_swap_failed: {e}"})
+
+        # OPTIONAL: give it a moment to settle before health check (helps flakiness)
+        time.sleep(float(cfg.get("post_hotswap_sleep_seconds", 1.0)))
+
+        # 2) Verify GPU health reflects desired model
+        try:
+            gpu_health = get_health(target)
+        except Exception as e:
+            return ExecutionResult(time.time(), "migrate_backend_to_gpu", False, {"error": f"gpu_health_failed: {e}", "admin_resp": admin_resp})
+
+        if gpu_health.get("model_uri") != desired_uri:
+            return ExecutionResult(
+                time.time(),
+                "migrate_backend_to_gpu",
+                False,
+                {"error": "gpu_model_mismatch", "desired_uri": desired_uri, "gpu_health": gpu_health, "admin_resp": admin_resp},
+            )
+
+        # 3) Switch router backend
+        try:
+            router_set_backend(cfg, target)
+            observed = router_get_backend(cfg)
+            ok = (observed == target)
+            if ok:
+                state["last_migrate_ts"] = time.time()
+                state["last_seen_backend"] = observed
+                write_state(state)
+
+            ver = {}
+            try:
+                ver = get_health(router_public)
+            except Exception:
+                pass
+
+            return ExecutionResult(
+                time.time(),
+                "migrate_backend_to_gpu",
+                ok,
+                {"observed_backend": observed, "router_health": ver, "gpu_health": gpu_health, "admin_resp": admin_resp},
+            )
+        except Exception as e:
+            return ExecutionResult(time.time(), "migrate_backend_to_gpu", False, {"error": str(e), "gpu_health": gpu_health, "admin_resp": admin_resp})
+
+
+    if decision.action == "rollback_backend_to_rms":
+        target = cfg["backend_rms_url"].rstrip("/")
+
+        # Use the model chosen by decision_agent (fallback to config if missing)
+        desired_uri = (decision.rationale or {}).get("chosen_uri") or pick_variant_model_uri(cfg, str(cfg.get("desired_variant", "fast")))
+        desired_delay = int(cfg.get("rms_desired_delay_ms", 40))
+
+        # 1) Hot-swap model on RMS (no restart)
+        try:
+            admin_resp = infer_admin_load_model(cfg, target, desired_uri, desired_delay)
+        except Exception as e:
+            return ExecutionResult(time.time(), "rollback_backend_to_rms", False, {"error": f"rms_hot_swap_failed: {e}"})
+
+        # OPTIONAL: settle
+        time.sleep(float(cfg.get("post_hotswap_sleep_seconds", 1.0)))
+
+        # 2) Verify RMS health reflects desired model
+        try:
+            rms_health = get_health(target)
+        except Exception as e:
+            return ExecutionResult(time.time(), "rollback_backend_to_rms", False, {"error": f"rms_health_failed: {e}", "admin_resp": admin_resp})
+
+        if rms_health.get("model_uri") != desired_uri:
+            return ExecutionResult(
+                time.time(),
+                "rollback_backend_to_rms",
+                False,
+                {"error": "rms_model_mismatch", "desired_uri": desired_uri, "rms_health": rms_health, "admin_resp": admin_resp},
+            )
+
+
+   #3) Switch router backend
+        try:
+            router_set_backend(cfg, target)
+            observed = router_get_backend(cfg)
+            ok = (observed == target)
+            if ok:
+                state["last_rollback_ts"] = time.time()
+                state["last_seen_backend"] = observed
+                write_state(state)
+
+            ver = {}
+            try:
+                ver = get_health(router_public)
+            except Exception:
+                pass
+
+            return ExecutionResult(
+                time.time(),
+                "rollback_backend_to_rms",
+                ok,
+                {"observed_backend": observed, "router_health": ver, "rms_health": rms_health, "admin_resp": admin_resp},
+            )
+        except Exception as e:
+            return ExecutionResult(time.time(), "rollback_backend_to_rms", False, {"error": str(e), "rms_health": rms_health, "admin_resp": admin_resp})
+
+
+
+
+    return ExecutionResult(now, decision.action, False, {"error": "unknown_action"})
+
+
+def explanation_agent(evt: Optional[Event], diag: Optional[Diagnosis], dec: Decision, res: ExecutionResult) -> None:
+    trace = {
+        "event": asdict(evt) if evt else None,
+        "diagnosis": asdict(diag) if diag else None,
+        "decision": asdict(dec),
+        "execution": asdict(res),
+    }
+
+    # add human-readable timestamps
+    if trace["event"] and "ts" in trace["event"]:
+        trace["event"]["ts_iso"] = ts_iso(trace["event"]["ts"])
+    if trace["diagnosis"] and "ts" in trace["diagnosis"]:
+        trace["diagnosis"]["ts_iso"] = ts_iso(trace["diagnosis"]["ts"])
+    if trace["decision"] and "ts" in trace["decision"]:
+        trace["decision"]["ts_iso"] = ts_iso(trace["decision"]["ts"])
+    if trace["execution"] and "ts" in trace["execution"]:
+        trace["execution"]["ts_iso"] = ts_iso(trace["execution"]["ts"])
+
+    print(json.dumps(trace, indent=2))
+    TRACE_PATH.write_text(json.dumps(trace, indent=2))
+
+    # append-only decision log
+    rotate_trace_log_if_needed()
+    with TRACE_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(trace) + "\n")
+
+
+
+def run_once() -> None:
+    cfg = load_cfg()
+    state = read_state()
+
+    evt = prioritize(observability_agent(cfg, state))
+    if evt is None:
+        dec = Decision(time.time(), "do_nothing", {"policy": "no_events"})
+        res = ExecutionResult(time.time(), "do_nothing", True, {"skipped": True})
+        explanation_agent(None, None, dec, res)
+        return
+
+    diag = diagnosis_agent(evt)
+    dec = decision_agent(cfg, diag, state)
+    res = execution_agent(cfg, dec, state)
+    explanation_agent(evt, diag, dec, res)
+
+
+def main():
+    cfg = load_cfg()
+    interval = int(cfg.get("check_interval_seconds", 15))
+    print(f"[AURA-OPS] loop started, interval={interval}s")
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            print(f"[AURA-OPS] error: {e}")
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    main()

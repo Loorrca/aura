@@ -1,0 +1,26 @@
+prometheus:
+  url: "http://137.194.194.39:9090"
+
+router:
+  public_url: "http://137.194.194.21:9000"
+  admin_url:  "http://137.194.194.21:9000"
+  admin_token: "cm91YWJsZWw="
+
+nodes:
+  rms:
+    infer_url: "http://137.194.194.122:8000"
+    prom_job: "rms_inference"
+    ssh:
+      user: "rms"
+      host: "137.194.194.122"
+    supports: ["full", "fast", "quant"]
+    default_delay_ms: 40
+
+  gpu:
+    infer_url: "http://137.194.194.39:18002"
+    prom_job: "gpu_inference"
+    ssh:
+      user: "gpu"
+      host: "10.194.12.1"
+    supports: ["full", "fast", "quant"]
+    default_delay_ms: 0

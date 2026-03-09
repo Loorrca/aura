@@ -1,0 +1,31 @@
+loop:
+  check_interval_seconds: 15
+
+cooldowns:
+  restart_seconds: 120
+  switch_seconds: 180
+  migrate_seconds: 30
+  rollback_seconds: 30
+
+verification:
+  post_hotswap_sleep_seconds: 1
+  infer_admin_timeout_seconds: 20
+
+slo:
+  latency_slo_ms: 20
+  min_rps_for_decision: 0.1
+
+signals:
+  gpu_util_threshold: 30
+
+promql_templates:
+  latency_p95_ms: '1000 * histogram_quantile(0.95, sum by (le) (rate(inference_latency_seconds_bucket{job="{{job}}"}[30s])))'
+  rps: 'sum(rate(inference_requests_total{job="{{job}}"}[2m]))'
+
+rules:
+  service_down:
+    promql: 'up{job="rms_inference"}'   # later: make this generic too
+    threshold: 1
+
+desired:
+  variant: "fast"

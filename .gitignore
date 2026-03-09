@@ -1,0 +1,11 @@
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/*.log
+**/*.pid
+ops/state/
+monitoring/grafana/
+monitoring/prometheus/data/
+*.db
+.env
+*.secret
